@@ -1,4 +1,5 @@
 # ServiceNow MCP Bootstrap
+<img width="1024" height="1024" alt="snclaude" src="https://github.com/user-attachments/assets/db6f2fd5-e342-4635-81c3-1c504bec8e96" />
 
 This project installs and configures a local ServiceNow MCP server for Claude Code on macOS.
 
