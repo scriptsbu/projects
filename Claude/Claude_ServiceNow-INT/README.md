@@ -27,6 +27,9 @@ Script variables this maps to:
 - `SN_CLIENT_ID`
 - `SN_REDIRECT_URI`
 
+<img width="1873" height="789" alt="  Application Registries" src="https://github.com/user-attachments/assets/5c18c707-cf84-4617-9985-00462da105fe" />
+
+
 ### 2. REST API Auth Scope
 
 Create/assign an auth scope that allows access to Table API for incidents.
@@ -40,6 +43,9 @@ Required values:
 Script variable this maps to:
 - `SN_SCOPE`
 
+<img width="1717" height="338" alt="  REST API Auth Scope" src="https://github.com/user-attachments/assets/5eea0278-e11c-4f83-b915-612d0b77f3f2" />
+
+
 ### 3. API Access Policy
 
 Create an API Access Policy that permits incident reads through Table API.
@@ -51,6 +57,9 @@ Recommended minimum policy:
 - Resource: `/now/table/{tableName}`
 - Table restriction: `incident`
 - Policy active: enabled
+
+<img width="1881" height="592" alt="  API Access Policies" src="https://github.com/user-attachments/assets/90e31f96-8bd0-4642-b0b8-5ddff25eee2d" />
+
 
 ### 4. Instance Base URL
 
