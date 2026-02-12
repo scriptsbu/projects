@@ -18,8 +18,9 @@ set -euo pipefail
 ### ---------------------------------------------------------------------------
 ### REQUIRED PROJECT CONFIG (set these for your environment/GitHub repo)
 ### ---------------------------------------------------------------------------
-SN_BASE="${SN_BASE:-https://DOMAIN.servicenowservices.com}"
+SN_BASE="${SN_BASE:-https://INSTANCE.servicenowservices.com}"
 SN_CLIENT_ID="${SN_CLIENT_ID:-INPUT_ID}"
+# Must include write-capable auth scope if using approval tools (PATCH sysapproval_approver).
 SN_SCOPE="${SN_SCOPE:-incident_read}"
 SN_REDIRECT_URI="${SN_REDIRECT_URI:-http://localhost:8765/callback}"
 SN_TOKEN_FILE_NAME="${SN_TOKEN_FILE_NAME:-.servicenow_prod_tokens.json}"
@@ -471,6 +472,22 @@ async def sn_get(path: str, params: Optional[dict[str, Any]] = None) -> dict[str
         return r.json()
 
 
+async def sn_patch(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    token = await get_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.patch(f"{SERVICENOW_BASE}{path}", headers=headers, json=payload)
+        r.raise_for_status()
+        if not r.content:
+            return {}
+        return r.json()
+
+
 # -----------------------------
 # MCP Tools
 # -----------------------------
@@ -492,6 +509,55 @@ INCIDENT_FIELDS = ",".join(
         "sys_updated_on",
     ]
 )
+
+TABLE_PREFIX_MAP = {
+    "INC": "incident",
+    "RITM": "sc_req_item",
+    "REQ": "sc_request",
+    "SCTASK": "sc_task",
+    "CHG": "change_request",
+    "PRB": "problem",
+}
+
+RECORD_LOOKUP_FIELDS = ",".join(
+    [
+        "sys_id",
+        "number",
+        "short_description",
+        "state",
+        "priority",
+        "sys_updated_on",
+        "assigned_to",
+    ]
+)
+
+
+def resolve_table_from_number(number: str) -> str:
+    normalized = (number or "").strip().upper()
+    for prefix, table in TABLE_PREFIX_MAP.items():
+        if normalized.startswith(prefix):
+            return table
+    raise ValueError(f"Unsupported record prefix for number: {number}")
+
+
+async def lookup_record_by_number(number: str) -> tuple[str, Optional[dict[str, Any]]]:
+    record_number = (number or "").strip().upper()
+    table = resolve_table_from_number(record_number)
+
+    data = await sn_get(
+        f"/api/now/table/{table}",
+        {
+            "sysparm_query": f"number={record_number}",
+            "sysparm_limit": 1,
+            "sysparm_fields": RECORD_LOOKUP_FIELDS,
+            "sysparm_display_value": "true",
+            "sysparm_exclude_reference_link": "true",
+        },
+    )
+    results = data.get("result", [])
+    if not results:
+        return table, None
+    return table, results[0]
 
 
 def incident_params(limit: int = 5, query: Optional[str] = None) -> dict[str, Any]:
@@ -542,6 +608,103 @@ async def get_incident_by_number(number: str) -> dict[str, Any]:
 
     logger.info(f"Incident found: {incident_number}")
     return {"found": True, "number": incident_number, "incident": results[0]}
+
+
+@mcp.tool()
+async def get_record_by_number(number: str) -> dict[str, Any]:
+    """
+    Retrieve a ServiceNow record by its number (INC, RITM, REQ, CHG, etc.)
+    """
+    record_number = (number or "").strip().upper()
+    if not record_number:
+        raise ValueError("Record number is required")
+
+    table, record = await lookup_record_by_number(record_number)
+    logger.info(f"Looking up record: {record_number} in table: {table}")
+
+    return {
+        "table": table,
+        "result": ([record] if record else []),
+    }
+
+
+@mcp.tool()
+async def approve_record_by_number(number: str, comments: str = "Approved via MCP") -> dict[str, Any]:
+    """
+    Approve a pending approval for a record number (INC, RITM, REQ, SCTASK, CHG, PRB).
+    Requires ServiceNow OAuth/API policy permission to PATCH sysapproval_approver.
+    """
+    record_number = (number or "").strip().upper()
+    if not record_number:
+        raise ValueError("Record number is required")
+
+    table, record = await lookup_record_by_number(record_number)
+    if not record:
+        return {
+            "approved": False,
+            "reason": "record_not_found",
+            "table": table,
+            "number": record_number,
+        }
+
+    record_sys_id = str(record.get("sys_id", "")).strip()
+    if not record_sys_id:
+        return {
+            "approved": False,
+            "reason": "record_sys_id_missing",
+            "table": table,
+            "number": record_number,
+            "record": record,
+        }
+
+    approvals = await sn_get(
+        "/api/now/table/sysapproval_approver",
+        {
+            "sysparm_query": f"sysapproval={record_sys_id}^state=requested",
+            "sysparm_limit": 1,
+            "sysparm_fields": "sys_id,state,approver,sysapproval,sys_updated_on",
+            "sysparm_display_value": "true",
+            "sysparm_exclude_reference_link": "true",
+        },
+    )
+    pending = approvals.get("result", [])
+    if not pending:
+        return {
+            "approved": False,
+            "reason": "no_pending_approval",
+            "table": table,
+            "number": record_number,
+            "record": record,
+        }
+
+    approval = pending[0]
+    approval_sys_id = str(approval.get("sys_id", "")).strip()
+    if not approval_sys_id:
+        return {
+            "approved": False,
+            "reason": "approval_sys_id_missing",
+            "table": table,
+            "number": record_number,
+            "record": record,
+            "approval": approval,
+        }
+
+    payload: dict[str, Any] = {"state": "approved"}
+    cleaned_comments = (comments or "").strip()
+    if cleaned_comments:
+        payload["comments"] = cleaned_comments
+
+    logger.info(f"Approving {record_number} using approval record {approval_sys_id}")
+    updated = await sn_patch(f"/api/now/table/sysapproval_approver/{approval_sys_id}", payload)
+
+    return {
+        "approved": True,
+        "table": table,
+        "number": record_number,
+        "record_sys_id": record_sys_id,
+        "approval_sys_id": approval_sys_id,
+        "updated_approval": updated.get("result", updated),
+    }
 
 
 if __name__ == "__main__":
