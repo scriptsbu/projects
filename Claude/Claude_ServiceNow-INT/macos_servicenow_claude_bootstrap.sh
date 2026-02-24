@@ -19,12 +19,27 @@ set -euo pipefail
 ### REQUIRED PROJECT CONFIG (set these for your environment/GitHub repo)
 ### ---------------------------------------------------------------------------
 SN_BASE="${SN_BASE:-https://INSTANCE.servicenowservices.com}"
-SN_CLIENT_ID="${SN_CLIENT_ID:-INPUT_ID}"
+SN_CLIENT_ID="${SN_CLIENT_ID:-${4:-}}"
 # Must include write-capable auth scope if using approval tools (PATCH sysapproval_approver).
 SN_SCOPE="${SN_SCOPE:-incident_read}"
 SN_REDIRECT_URI="${SN_REDIRECT_URI:-http://localhost:8765/callback}"
 SN_TOKEN_FILE_NAME="${SN_TOKEN_FILE_NAME:-.servicenow_prod_tokens.json}"
 MCP_SERVER_NAME="${MCP_SERVER_NAME:-servicenow}"
+
+### ---------------------------------------------------------------------------
+### Validate required config
+### ---------------------------------------------------------------------------
+if [[ -z "$SN_CLIENT_ID" ]]; then
+  echo "ERROR: SN_CLIENT_ID is empty."
+  echo "  Set it via environment variable: export SN_CLIENT_ID=your_client_id"
+  echo "  Or via Jamf Parameter 4 in the policy."
+  exit 1
+fi
+
+if [[ -z "$SN_BASE" ]]; then
+  echo "ERROR: SN_BASE is empty."
+  exit 1
+fi
 
 ### ---------------------------------------------------------------------------
 ### User targeting (Jamf-safe)
@@ -51,6 +66,7 @@ fi
 MCP_DIR="$TARGET_HOME/.servicenow_mcp"
 VENV_DIR="$MCP_DIR/venv"
 MCP_SCRIPT="$MCP_DIR/servicenow_mcp.py"
+MCP_CONFIG="$MCP_DIR/config.json"
 TOKENS_FILE="$TARGET_HOME/$SN_TOKEN_FILE_NAME"
 
 
@@ -69,8 +85,16 @@ as_user() {
 # Only clear token cache if it's invalid or expired
 log "Checking existing token cache: $TOKENS_FILE"
 if [[ -f "$TOKENS_FILE" ]]; then
-  # Check if token is expired (simple check - just see if file is readable)
-  if ! as_user python3 -c "import json; f=open('$TOKENS_FILE'); d=json.load(f); import time; exit(0 if time.time() < d.get('expires_at', 0) else 1)" 2>/dev/null; then
+  # Pass token path via env var to avoid shell-to-python injection
+  if ! as_user env SN_TOKEN_PATH="$TOKENS_FILE" python3 -c '
+import json, os, sys, time
+try:
+    with open(os.environ["SN_TOKEN_PATH"]) as f:
+        d = json.load(f)
+    sys.exit(0 if time.time() < d.get("expires_at", 0) else 1)
+except Exception:
+    sys.exit(1)
+' 2>/dev/null; then
     log "Token is expired or invalid, removing: $TOKENS_FILE"
     as_user rm -f "$TOKENS_FILE"
   else
@@ -111,12 +135,29 @@ install_python_org_pkg() {
   # NOTE: This requires the Mac to have network access. Jamf typically does.
   # We install to system location; then we use it only to create a per-user venv.
   local PKG_URL="https://www.python.org/ftp/python/3.12.8/python-3.12.8-macos11.pkg"
-  local PKG_PATH="/tmp/python-3.12.8-macos11.pkg"
+  local PKG_SHA256="78940fccbb3cd8f48a8a9e3b1696be6a57704a8c4e4f9b6a58ce534ae588a0cb"
+  local TMPDIR_PKG
+  TMPDIR_PKG="$(mktemp -d)"
+  local PKG_PATH="$TMPDIR_PKG/python-3.12.8-macos11.pkg"
+
+  # Ensure temp dir is cleaned up on exit from this function
+  trap 'rm -rf "$TMPDIR_PKG"' RETURN
 
   log "Installing Python via python.org pkg (3.12.8)..."
   curl -fsSL "$PKG_URL" -o "$PKG_PATH"
+
+  # Verify download integrity
+  local ACTUAL_SHA256
+  ACTUAL_SHA256="$(shasum -a 256 "$PKG_PATH" | awk '{print $1}')"
+  if [[ "$ACTUAL_SHA256" != "$PKG_SHA256" ]]; then
+    log "ERROR: SHA-256 mismatch for Python installer package!"
+    log "  Expected: $PKG_SHA256"
+    log "  Got:      $ACTUAL_SHA256"
+    exit 1
+  fi
+  log "SHA-256 verified."
+
   /usr/sbin/installer -pkg "$PKG_PATH" -target /
-  rm -f "$PKG_PATH"
 }
 
 # packaging may not exist on system python; avoid that dependency.
@@ -182,13 +223,13 @@ if [[ -x "$VENV_DIR/bin/python" ]]; then
   EXISTING_VENV_MM="$(as_user "$VENV_DIR/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
   if [[ -z "$EXISTING_VENV_MM" ]]; then
     log "Existing venv is unreadable. Recreating: $VENV_DIR"
-    rm -rf "$VENV_DIR"
+    as_user rm -rf "$VENV_DIR"
   elif [[ "$EXISTING_VENV_MM" != "$SELECTED_PY_MM" ]]; then
     log "Existing venv uses Python $EXISTING_VENV_MM; expected $SELECTED_PY_MM. Recreating."
-    rm -rf "$VENV_DIR"
+    as_user rm -rf "$VENV_DIR"
   elif ! as_user "$VENV_DIR/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
     log "Existing venv Python is older than 3.11. Recreating: $VENV_DIR"
-    rm -rf "$VENV_DIR"
+    as_user rm -rf "$VENV_DIR"
   fi
 fi
 
@@ -206,11 +247,44 @@ as_user "$VENV_DIR/bin/python" -m pip install --upgrade pip
 as_user "$VENV_DIR/bin/python" -m pip install --upgrade httpx mcp
 
 ### ---------------------------------------------------------------------------
+### Write config file (keeps secrets out of the Python source)
+### ---------------------------------------------------------------------------
+log "Writing MCP config: $MCP_CONFIG"
+
+# Write config as JSON via Python to safely handle any special characters
+as_user env \
+  _SN_BASE="$SN_BASE" \
+  _SN_CLIENT_ID="$SN_CLIENT_ID" \
+  _SN_SCOPE="$SN_SCOPE" \
+  _SN_REDIRECT_URI="$SN_REDIRECT_URI" \
+  _SN_TOKEN_FILE="$TOKENS_FILE" \
+  _SN_MCP_NAME="$MCP_SERVER_NAME" \
+  python3 -c '
+import json, os
+config = {
+    "servicenow_base": os.environ["_SN_BASE"],
+    "client_id": os.environ["_SN_CLIENT_ID"],
+    "scope": os.environ["_SN_SCOPE"],
+    "redirect_uri": os.environ["_SN_REDIRECT_URI"],
+    "token_file": os.environ["_SN_TOKEN_FILE"],
+    "mcp_server_name": os.environ["_SN_MCP_NAME"],
+}
+path = os.path.join(os.path.expanduser("~"), ".servicenow_mcp", "config.json")
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(config, f, indent=2)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+'
+
+### ---------------------------------------------------------------------------
 ### Write ServiceNow MCP server (PROD, PKCE + refresh)
 ### ---------------------------------------------------------------------------
 log "Writing MCP server script: $MCP_SCRIPT"
 
-cat > "$MCP_SCRIPT" <<PYEOF
+# Quoted heredoc — no shell variable expansion inside.
+# All config is read from config.json at runtime.
+cat > "$MCP_SCRIPT" <<'PYEOF'
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -220,12 +294,14 @@ import http.server
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import threading
 import time
 import urllib.parse
 import webbrowser
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -239,17 +315,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger("servicenow-mcp")
 
-SERVICENOW_BASE = "${SN_BASE}"
-CLIENT_ID = "${SN_CLIENT_ID}"
-SCOPE = "${SN_SCOPE}"
-REDIRECT_URI = "${SN_REDIRECT_URI}"
-TOKEN_FILE = os.path.expanduser("${TOKENS_FILE}")
-MCP_SERVER_NAME = "${MCP_SERVER_NAME}"
+# ------------------------------------
+# Load config from adjacent JSON file
+# ------------------------------------
+_CONFIG_PATH = Path(__file__).parent / "config.json"
+if not _CONFIG_PATH.exists():
+    logger.error(f"Config file not found: {_CONFIG_PATH}")
+    sys.exit(1)
+
+with open(_CONFIG_PATH, "r", encoding="utf-8") as _f:
+    _CFG = json.load(_f)
+
+SERVICENOW_BASE: str = _CFG["servicenow_base"]
+CLIENT_ID: str = _CFG["client_id"]
+SCOPE: str = _CFG["scope"]
+REDIRECT_URI: str = _CFG["redirect_uri"]
+TOKEN_FILE: str = os.path.expanduser(_CFG["token_file"])
+MCP_SERVER_NAME: str = _CFG["mcp_server_name"]
 
 # Hardened timeouts
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
 
+# ------------------------------------
+# Startup scope warning
+# ------------------------------------
+_WRITE_SCOPE_KEYWORDS = {"useraccount", "write", "admin", "approval"}
+if not any(kw in SCOPE.lower() for kw in _WRITE_SCOPE_KEYWORDS):
+    logger.warning(
+        f"OAuth scope is '{SCOPE}' (read-only). "
+        "The approve_record_by_number tool requires write access to sysapproval_approver. "
+        "Approvals will fail with HTTP 403 unless the scope is updated in config.json."
+    )
+
 mcp = FastMCP(MCP_SERVER_NAME)
+
+# ------------------------------------
+# Input validation
+# ------------------------------------
+# Matches ServiceNow record numbers: 2-6 uppercase letters followed by 5-10 digits.
+# Prevents query operator injection (e.g. 'INC0001^ORstate=1').
+_RECORD_NUMBER_RE = re.compile(r"^[A-Z]{2,6}\d{5,10}$")
+
+
+def validate_record_number(number: str) -> str:
+    """Sanitize and validate a ServiceNow record number."""
+    cleaned = (number or "").strip().upper()
+    if not cleaned:
+        raise ValueError("Record number is required")
+    if not _RECORD_NUMBER_RE.match(cleaned):
+        raise ValueError(
+            f"Invalid record number format: {cleaned!r}. "
+            "Expected pattern: 2-6 letters followed by 5-10 digits (e.g. INC0013330, RITM0012345)."
+        )
+    return cleaned
 
 
 # -----------------------------
@@ -284,12 +402,17 @@ class OAuthHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"Missing authorization code.")
 
     def log_message(self, format: str, *args: Any) -> None:
-        # Suppress noisy logs
-        return
+        logger.debug(format, *args)
 
 
 def wait_for_code(expected_state: str, port: int = 8765, timeout_s: int = 180) -> str:
-    server = http.server.HTTPServer(("localhost", port), OAuthHandler)
+    try:
+        server = http.server.HTTPServer(("localhost", port), OAuthHandler)
+    except OSError as e:
+        raise RuntimeError(
+            f"Cannot bind to localhost:{port} for OAuth callback. "
+            f"Another process may be using this port. Error: {e}"
+        ) from e
 
     def _serve_one():
         server.handle_request()
@@ -357,6 +480,10 @@ def save_tokens(tokens: dict[str, Any]) -> None:
 # OAuth flows
 # -----------------------------
 async def oauth_authorize_code_flow() -> dict[str, Any]:
+    # Reset class-level state to prevent stale values from prior invocations
+    OAuthHandler.auth_code = None
+    OAuthHandler.received_state = None
+
     verifier, challenge = generate_pkce()
 
     state = secrets.token_urlsafe(16)
@@ -533,7 +660,7 @@ RECORD_LOOKUP_FIELDS = ",".join(
 
 
 def resolve_table_from_number(number: str) -> str:
-    normalized = (number or "").strip().upper()
+    normalized = validate_record_number(number)
     for prefix, table in TABLE_PREFIX_MAP.items():
         if normalized.startswith(prefix):
             return table
@@ -541,7 +668,7 @@ def resolve_table_from_number(number: str) -> str:
 
 
 async def lookup_record_by_number(number: str) -> tuple[str, Optional[dict[str, Any]]]:
-    record_number = (number or "").strip().upper()
+    record_number = validate_record_number(number)
     table = resolve_table_from_number(record_number)
 
     data = await sn_get(
@@ -592,9 +719,7 @@ async def get_recent_incidents(limit: int = 5) -> list[dict[str, Any]]:
 @mcp.tool()
 async def get_incident_by_number(number: str) -> dict[str, Any]:
     """Lookup a single incident by exact number, e.g. INC0013330."""
-    incident_number = (number or "").strip().upper()
-    if not incident_number:
-        raise ValueError("Incident number is required")
+    incident_number = validate_record_number(number)
 
     logger.info(f"Looking up incident: {incident_number}")
     data = await sn_get(
@@ -615,9 +740,7 @@ async def get_record_by_number(number: str) -> dict[str, Any]:
     """
     Retrieve a ServiceNow record by its number (INC, RITM, REQ, CHG, etc.)
     """
-    record_number = (number or "").strip().upper()
-    if not record_number:
-        raise ValueError("Record number is required")
+    record_number = validate_record_number(number)
 
     table, record = await lookup_record_by_number(record_number)
     logger.info(f"Looking up record: {record_number} in table: {table}")
@@ -634,9 +757,7 @@ async def approve_record_by_number(number: str, comments: str = "Approved via MC
     Approve a pending approval for a record number (INC, RITM, REQ, SCTASK, CHG, PRB).
     Requires ServiceNow OAuth/API policy permission to PATCH sysapproval_approver.
     """
-    record_number = (number or "").strip().upper()
-    if not record_number:
-        raise ValueError("Record number is required")
+    record_number = validate_record_number(number)
 
     table, record = await lookup_record_by_number(record_number)
     if not record:
