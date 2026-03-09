@@ -171,7 +171,7 @@ struct ContentView: View {
                 Built with Claude Code (Anthropic)
 
                 License: MIT — Free to use, modify, and distribute.
-                https://github.com/scriptsbu/projects/DiskCloner
+                https://github.com/scriptsbu/projects/
                 """,
                 attributes: [
                     .font: NSFont.systemFont(ofSize: 11),
