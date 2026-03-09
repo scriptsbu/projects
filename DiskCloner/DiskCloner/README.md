@@ -18,13 +18,13 @@ A simple, free macOS utility for cloning USB drives and SSDs. Built for duplicat
 ### Option 1: One-liner CLI (no install needed)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/scriptsbu/projects/main/DiskCloner/diskcloner.sh | bash
+bash <(curl -Ls https://github.com/scriptsbu/projects/raw/refs/heads/main/DiskCloner/DiskCloner/diskcloner.sh)
 ```
 
 Or download and run locally:
 
 ```bash
-curl -fsSL -o diskcloner.sh https://raw.githubusercontent.com/scriptsbu/projects/main/DiskCloner/diskcloner.sh
+bash <(curl -o diskcloner.sh https://github.com/scriptsbu/projects/raw/refs/heads/main/DiskCloner/DiskCloner/diskcloner.sh)
 chmod +x diskcloner.sh
 ./diskcloner.sh
 ```
