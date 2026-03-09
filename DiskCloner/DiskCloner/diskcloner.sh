@@ -141,7 +141,7 @@ print_disks() {
         exit 1
     fi
 
-    echo -e "${BOLD}Available Disks:${NC}"
+    echo -e "${BOLD}Available Disks (Select Source):${NC}"
     echo ""
     for i in "${!DISK_IDS[@]}"; do
         local vol_display=""
